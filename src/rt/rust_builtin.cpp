@@ -980,6 +980,12 @@ rust_task_deref(rust_task *task) {
     task->deref();
 }
 
+// Only use if you're sure it won't free.
+extern "C" void
+rust_task_deref_fast(rust_task *task) {
+    task->deref();
+}
+
 //
 // Local Variables:
 // mode: C++

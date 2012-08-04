@@ -948,8 +948,7 @@ fn leave_taskgroup(state: taskgroup_inner, me: *rust_task, is_member: bool) {
         let group = option::unwrap(newstate);
         taskset_remove(if is_member { &mut group.members }
                        else         { &mut group.descendants }, me);
-        // to-do(bblum): also try a fastpath that rust_stacks.
-        rustrt::rust_task_deref(me);
+        rustrt::rust_task_deref_fast(me);
         *state = some(group);
     }
 }
@@ -973,8 +972,10 @@ fn kill_taskgroup(+group: taskgroup_data, me: *rust_task, is_main: bool) {
         // Skip self - killing ourself won't do much good.
         if sibling != me {
             rustrt::rust_task_kill_other(sibling);
+            rustrt::rust_task_deref(sibling);
+        } else {
+            rustrt::rust_task_deref_fast(me);
         }
-        rustrt::rust_task_deref(sibling);
     }
     for taskset_each(&group.descendants) |+child| {
         assert child != me;
@@ -1449,6 +1450,8 @@ extern mod rustrt {
     #[rust_stack]
     fn rust_task_ref(task: *rust_task);
     fn rust_task_deref(task: *rust_task);
+    #[rust_stack]
+    fn rust_task_deref_fast(task: *rust_task);
 
     #[rust_stack]
     fn rust_get_task_local_data(task: *rust_task) -> *libc::c_void;
