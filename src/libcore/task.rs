@@ -806,12 +806,11 @@ fn each_ancestor(list:        &mut ancestor_list,
                         do tg_opt.iter |tg| {
                             nobe_is_dead = taskgroup_is_dead(tg);
                         }
-                        // Call iterator block. (If the group is dead, it's
-                        // safe to skip it. This will leave our *rust_task
-                        // hanging around in the group even after it's freed,
-                        // but that's ok because, by virtue of the group being
-                        // dead, nobody will ever kill-all (foreach) over it.)
-                        if nobe_is_dead { true } else { forward_blk(tg_opt) }
+                        // Call iterator block. Even if the group is dead,
+                        // we must do this, because it is never safe to skip
+                        // leaving it at task exit, because all tasks in it
+                        // are refcounted.
+                        forward_blk(tg_opt)
                     };
                 /*##########################################################*
                  * Step 2: Recurse on the rest of the list; maybe coalescing.
@@ -827,7 +826,7 @@ fn each_ancestor(list:        &mut ancestor_list,
                 /*##########################################################*
                  * Step 3: Maybe unwind; compute return info for our caller.
                  *##########################################################*/
-                if need_unwind && !nobe_is_dead {
+                if need_unwind {
                     do bail_opt.iter |bail_blk| {
                         do with_parent_tg(&mut nobe.parent_group) |tg_opt| {
                             bail_blk(tg_opt)
@@ -841,6 +840,12 @@ fn each_ancestor(list:        &mut ancestor_list,
                     // Swap the list out here; the caller replaces us with it.
                     let rest = util::replace(&mut nobe.ancestors,
                                              ancestor_list(none));
+                    // Need to deref all task pointers in the dead nobe.
+                    do with_parent_tg(&mut nobe.parent_group) |tg_opt| {
+                        // The option could only be 'none' if the group were
+                        // failing, but failing groups are not dead groups.
+                        cleanup_dead_taskgroup(option::swap_unwrap(tg_opt));
+                    }
                     (some(rest), need_unwind)
                 } else {
                     (none, need_unwind)
@@ -884,8 +889,12 @@ class tcb {
         if rustrt::rust_task_is_unwinding(self.me) {
             self.notifier.iter(|x| { x.failed = true; });
             // Take everybody down with us.
+            let mut state = none;
             do access_group(self.tasks) |tg| {
-                kill_taskgroup(tg, self.me, self.is_main);
+                util::swap(tg, &mut state);
+            }
+            if state.is_some() {
+                kill_taskgroup(option::unwrap(state), self.me, self.is_main);
             }
         } else {
             // Remove ourselves from the group(s).
@@ -923,6 +932,7 @@ fn enlist_in_taskgroup(state: taskgroup_inner, me: *rust_task,
         let group = option::unwrap(newstate);
         taskset_insert(if is_member { &mut group.members }
                        else         { &mut group.descendants }, me);
+        rustrt::rust_task_ref(me);
         *state = some(group);
         true
     } else {
@@ -938,12 +948,15 @@ fn leave_taskgroup(state: taskgroup_inner, me: *rust_task, is_member: bool) {
         let group = option::unwrap(newstate);
         taskset_remove(if is_member { &mut group.members }
                        else         { &mut group.descendants }, me);
+        // to-do(bblum): also try a fastpath that rust_stacks.
+        rustrt::rust_task_deref(me);
         *state = some(group);
     }
 }
 
 // NB: Runs in destructor/post-exit context. Can't 'fail'.
-fn kill_taskgroup(state: taskgroup_inner, me: *rust_task, is_main: bool) {
+fn kill_taskgroup(+group: taskgroup_data, me: *rust_task, is_main: bool) {
+    // to-do(bblum): Replace this comment and cleanup
     // NB: We could do the killing iteration outside of the group arc, by
     // having "let mut newstate" here, swapping inside, and iterating after.
     // But that would let other exiting tasks fall-through and exit while we
@@ -952,30 +965,34 @@ fn kill_taskgroup(state: taskgroup_inner, me: *rust_task, is_main: bool) {
     // so if we're failing, all concurrently exiting tasks must wait for us.
     // To do it differently, we'd have to use the runtime's task refcounting,
     // but that could leave task structs around long after their task exited.
-    let newstate = util::replace(state, none);
+    // let newstate = util::replace(state, none);
     // Might already be none, if somebody is failing simultaneously.
     // That's ok; only one task needs to do the dirty work. (Might also
     // see 'none' if somebody already failed and we got a kill signal.)
-    if newstate.is_some() {
-        let group = option::unwrap(newstate);
-        for taskset_each(&group.members) |+sibling| {
-            // Skip self - killing ourself won't do much good.
-            if sibling != me {
-                rustrt::rust_task_kill_other(sibling);
-            }
+    for taskset_each(&group.members) |+sibling| {
+        // Skip self - killing ourself won't do much good.
+        if sibling != me {
+            rustrt::rust_task_kill_other(sibling);
         }
-        for taskset_each(&group.descendants) |+child| {
-            assert child != me;
-            rustrt::rust_task_kill_other(child);
-        }
-        // Only one task should ever do this.
-        if is_main {
-            rustrt::rust_task_kill_all(me);
-        }
-        // Do NOT restore state to some(..)! It stays none to indicate
-        // that the whole taskgroup is failing, to forbid new spawns.
+        rustrt::rust_task_deref(sibling);
     }
-    // (note: multiple tasks may reach this point)
+    for taskset_each(&group.descendants) |+child| {
+        assert child != me;
+        rustrt::rust_task_kill_other(child);
+        rustrt::rust_task_deref(child);
+    }
+    // Only one task should ever do this.
+    if is_main {
+        rustrt::rust_task_kill_all(me);
+    }
+}
+
+// to-do(bblum): Document
+fn cleanup_dead_taskgroup(+group: taskgroup_data) {
+    assert taskgroup_is_dead(group);
+    for taskset_each(&group.descendants) |task| {
+        rustrt::rust_task_deref(task);
+    }
 }
 
 // FIXME (#2912): Work around core-vs-coretest function duplication. Can't use
@@ -996,6 +1013,7 @@ fn gen_child_taskgroup(linked: bool, supervised: bool)
             // Main task, doing first spawn ever. Lazily initialise here.
             let mut members = new_taskset();
             taskset_insert(&mut members, spawner);
+            rustrt::rust_task_ref(spawner);
             let tasks =
                 arc::exclusive(some({ mut members:     members,
                                       mut descendants: new_taskset() }));
@@ -1427,6 +1445,10 @@ extern mod rustrt {
     fn rust_task_allow_yield(t: *rust_task);
     fn rust_task_kill_other(task: *rust_task);
     fn rust_task_kill_all(task: *rust_task);
+
+    #[rust_stack]
+    fn rust_task_ref(task: *rust_task);
+    fn rust_task_deref(task: *rust_task);
 
     #[rust_stack]
     fn rust_get_task_local_data(task: *rust_task) -> *libc::c_void;
